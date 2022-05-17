@@ -21,6 +21,7 @@ pub mod protobuf {
     include!(concat!(env!("OUT_DIR"), "/datafusion.rs"));
 }
 
+pub mod bytes;
 pub mod from_proto;
 pub mod to_proto;
 
@@ -30,12 +31,13 @@ mod roundtrip_tests {
     use super::protobuf;
     use datafusion::arrow::array::ArrayRef;
     use datafusion::logical_plan::create_udaf;
-    use datafusion::physical_plan::functions::{make_scalar_function, Volatility};
+    use datafusion::physical_plan::functions::make_scalar_function;
     use datafusion::physical_plan::Accumulator;
     use datafusion::{
         arrow::datatypes::{DataType, Field, IntervalUnit, TimeUnit, UnionMode},
+        logical_expr::{BuiltinScalarFunction::Sqrt, Volatility},
         logical_plan::{col, Expr},
-        physical_plan::{aggregates, functions::BuiltinScalarFunction::Sqrt},
+        physical_plan::aggregates,
         prelude::*,
         scalar::ScalarValue,
     };

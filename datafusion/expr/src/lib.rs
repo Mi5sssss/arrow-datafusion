@@ -15,34 +15,61 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! [DataFusion](https://github.com/apache/arrow-datafusion)
+//! is an extensible query execution framework that uses
+//! [Apache Arrow](https://arrow.apache.org) as its in-memory format.
+//!
+//! This crate is a submodule of DataFusion that provides types representing
+//! logical query plans ([LogicalPlan]) and logical expressions ([Expr]) as well as utilities for
+//! working with these types.
+//!
+//! The [expr_fn] module contains functions for creating expressions.
+
 mod accumulator;
-mod aggregate_function;
+pub mod aggregate_function;
+pub mod array_expressions;
+pub mod binary_rule;
 mod built_in_function;
 mod columnar_value;
+pub mod conditional_expressions;
 pub mod expr;
 pub mod expr_fn;
-mod function;
+pub mod expr_rewriter;
+pub mod expr_schema;
+pub mod expr_visitor;
+pub mod field_util;
+pub mod function;
 mod literal;
+pub mod logical_plan;
+mod nullif;
 mod operator;
 mod signature;
+pub mod struct_expressions;
+mod table_source;
+pub mod type_coercion;
 mod udaf;
 mod udf;
-mod window_frame;
-mod window_function;
+pub mod utils;
+pub mod window_frame;
+pub mod window_function;
 
 pub use accumulator::Accumulator;
 pub use aggregate_function::AggregateFunction;
 pub use built_in_function::BuiltinScalarFunction;
 pub use columnar_value::{ColumnarValue, NullColumnarValue};
 pub use expr::Expr;
-pub use expr_fn::{col, sum};
+pub use expr_fn::*;
+pub use expr_schema::ExprSchemable;
 pub use function::{
     AccumulatorFunctionImplementation, ReturnTypeFunction, ScalarFunctionImplementation,
     StateTypeFunction,
 };
 pub use literal::{lit, lit_timestamp_nano, Literal, TimestampLiteral};
+pub use logical_plan::{LogicalPlan, PlanVisitor};
+pub use nullif::SUPPORTED_NULLIF_TYPES;
 pub use operator::Operator;
 pub use signature::{Signature, TypeSignature, Volatility};
+pub use table_source::{TableProviderFilterPushDown, TableSource, TableType};
 pub use udaf::AggregateUDF;
 pub use udf::ScalarUDF;
 pub use window_frame::{WindowFrame, WindowFrameBound, WindowFrameUnits};

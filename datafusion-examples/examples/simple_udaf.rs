@@ -23,9 +23,8 @@ use datafusion::arrow::{
 };
 
 use datafusion::from_slice::FromSlice;
-use datafusion::physical_plan::functions::Volatility;
 use datafusion::{error::Result, logical_plan::create_udaf, physical_plan::Accumulator};
-use datafusion::{prelude::*, scalar::ScalarValue};
+use datafusion::{logical_expr::Volatility, prelude::*, scalar::ScalarValue};
 use std::sync::Arc;
 
 // create local session context with an in-memory table
@@ -128,7 +127,7 @@ impl Accumulator for GeometricMean {
     fn update_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
         if values.is_empty() {
             return Ok(());
-        };
+        }
         (0..values[0].len()).try_for_each(|index| {
             let v = values
                 .iter()
@@ -144,7 +143,7 @@ impl Accumulator for GeometricMean {
     fn merge_batch(&mut self, states: &[ArrayRef]) -> Result<()> {
         if states.is_empty() {
             return Ok(());
-        };
+        }
         (0..states[0].len()).try_for_each(|index| {
             let v = states
                 .iter()

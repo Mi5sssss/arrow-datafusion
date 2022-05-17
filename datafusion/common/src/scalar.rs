@@ -39,6 +39,8 @@ use std::{convert::TryFrom, fmt, iter::repeat, sync::Arc};
 /// This is the single-valued counter-part of arrow’s `Array`.
 #[derive(Clone)]
 pub enum ScalarValue {
+    /// represents `DataType::Null` (castable to/from any other type)
+    Null,
     /// true or false value
     Boolean(Option<bool>),
     /// 32bit float
@@ -170,6 +172,8 @@ impl PartialEq for ScalarValue {
             (IntervalMonthDayNano(_), _) => false,
             (Struct(v1, t1), Struct(v2, t2)) => v1.eq(v2) && t1.eq(t2),
             (Struct(_, _), _) => false,
+            (Null, Null) => true,
+            (Null, _) => false,
         }
     }
 }
@@ -270,6 +274,8 @@ impl PartialOrd for ScalarValue {
                 }
             }
             (Struct(_, _), _) => None,
+            (Null, Null) => Some(Ordering::Equal),
+            (Null, _) => None,
         }
     }
 }
@@ -325,6 +331,8 @@ impl std::hash::Hash for ScalarValue {
                 v.hash(state);
                 t.hash(state);
             }
+            // stable hash for Null value
+            Null => 1.hash(state),
         }
     }
 }
@@ -594,6 +602,7 @@ impl ScalarValue {
                 DataType::Interval(IntervalUnit::MonthDayNano)
             }
             ScalarValue::Struct(_, fields) => DataType::Struct(fields.as_ref().clone()),
+            ScalarValue::Null => DataType::Null,
         }
     }
 
@@ -623,7 +632,8 @@ impl ScalarValue {
     pub fn is_null(&self) -> bool {
         matches!(
             *self,
-            ScalarValue::Boolean(None)
+            ScalarValue::Null
+                | ScalarValue::Boolean(None)
                 | ScalarValue::UInt8(None)
                 | ScalarValue::UInt16(None)
                 | ScalarValue::UInt32(None)
@@ -702,141 +712,133 @@ impl ScalarValue {
         /// Creates an array of $ARRAY_TY by unpacking values of
         /// SCALAR_TY for primitive types
         macro_rules! build_array_primitive {
-      ($ARRAY_TY:ident, $SCALAR_TY:ident) => {{
-        {
-          let array = scalars
-            .map(|sv| {
-              if let ScalarValue::$SCALAR_TY(v) = sv {
-                Ok(v)
-              } else {
-                Err(DataFusionError::Internal(format!(
-                  "Inconsistent types in ScalarValue::iter_to_array. \
-                                     Expected {:?}, got {:?}",
-                  data_type, sv
-                )))
-              }
-            })
-            .collect::<Result<$ARRAY_TY>>()?;
-
-          Arc::new(array)
+            ($ARRAY_TY:ident, $SCALAR_TY:ident) => {{
+                {
+                    let array = scalars.map(|sv| {
+                        if let ScalarValue::$SCALAR_TY(v) = sv {
+                            Ok(v)
+                        } else {
+                            Err(DataFusionError::Internal(format!(
+                                "Inconsistent types in ScalarValue::iter_to_array. \
+                                    Expected {:?}, got {:?}",
+                                data_type, sv
+                            )))
+                        }
+                    })
+                    .collect::<Result<$ARRAY_TY>>()?;
+                    Arc::new(array)
+                }
+            }};
         }
-      }};
-    }
 
         macro_rules! build_array_primitive_tz {
-      ($ARRAY_TY:ident, $SCALAR_TY:ident) => {{
-        {
-          let array = scalars
-            .map(|sv| {
-              if let ScalarValue::$SCALAR_TY(v, _) = sv {
-                Ok(v)
-              } else {
-                Err(DataFusionError::Internal(format!(
-                  "Inconsistent types in ScalarValue::iter_to_array. \
-                                     Expected {:?}, got {:?}",
-                  data_type, sv
-                )))
-              }
-            })
-            .collect::<Result<$ARRAY_TY>>()?;
-
-          Arc::new(array)
+            ($ARRAY_TY:ident, $SCALAR_TY:ident) => {{
+                {
+                    let array = scalars.map(|sv| {
+                        if let ScalarValue::$SCALAR_TY(v, _) = sv {
+                            Ok(v)
+                        } else {
+                            Err(DataFusionError::Internal(format!(
+                                "Inconsistent types in ScalarValue::iter_to_array. \
+                                    Expected {:?}, got {:?}",
+                                data_type, sv
+                            )))
+                        }
+                    })
+                    .collect::<Result<$ARRAY_TY>>()?;
+                    Arc::new(array)
+                }
+            }};
         }
-      }};
-    }
 
         /// Creates an array of $ARRAY_TY by unpacking values of
         /// SCALAR_TY for "string-like" types.
         macro_rules! build_array_string {
-      ($ARRAY_TY:ident, $SCALAR_TY:ident) => {{
-        {
-          let array = scalars
-            .map(|sv| {
-              if let ScalarValue::$SCALAR_TY(v) = sv {
-                Ok(v)
-              } else {
-                Err(DataFusionError::Internal(format!(
-                  "Inconsistent types in ScalarValue::iter_to_array. \
-                                     Expected {:?}, got {:?}",
-                  data_type, sv
-                )))
-              }
-            })
-            .collect::<Result<$ARRAY_TY>>()?;
-          Arc::new(array)
+            ($ARRAY_TY:ident, $SCALAR_TY:ident) => {{
+                {
+                    let array = scalars.map(|sv| {
+                        if let ScalarValue::$SCALAR_TY(v) = sv {
+                            Ok(v)
+                        } else {
+                            Err(DataFusionError::Internal(format!(
+                                "Inconsistent types in ScalarValue::iter_to_array. \
+                                    Expected {:?}, got {:?}",
+                                data_type, sv
+                            )))
+                        }
+                    })
+                    .collect::<Result<$ARRAY_TY>>()?;
+                    Arc::new(array)
+                }
+            }};
         }
-      }};
-    }
 
         macro_rules! build_array_list_primitive {
-      ($ARRAY_TY:ident, $SCALAR_TY:ident, $NATIVE_TYPE:ident) => {{
-        Arc::new(ListArray::from_iter_primitive::<$ARRAY_TY, _, _>(
-          scalars.into_iter().map(|x| match x {
-            ScalarValue::List(xs, _) => xs.map(|x| {
-              x.iter()
-                .map(|x| match x {
-                  ScalarValue::$SCALAR_TY(i) => *i,
-                  sv => panic!(
-                    "Inconsistent types in ScalarValue::iter_to_array. \
-                                    Expected {:?}, got {:?}",
-                    data_type, sv
-                  ),
-                })
-                .collect::<Vec<Option<$NATIVE_TYPE>>>()
-            }),
-            sv => panic!(
-              "Inconsistent types in ScalarValue::iter_to_array. \
-                        Expected {:?}, got {:?}",
-              data_type, sv
-            ),
-          }),
-        ))
-      }};
-    }
-
-        macro_rules! build_array_list_string {
-      ($BUILDER:ident, $SCALAR_TY:ident) => {{
-        let mut builder = ListBuilder::new($BUILDER::new(0));
-
-        for scalar in scalars.into_iter() {
-          match scalar {
-            ScalarValue::List(Some(xs), _) => {
-              let xs = *xs;
-              for s in xs {
-                match s {
-                  ScalarValue::$SCALAR_TY(Some(val)) => {
-                    builder.values().append_value(val)?;
-                  }
-                  ScalarValue::$SCALAR_TY(None) => {
-                    builder.values().append_null()?;
-                  }
-                  sv => {
-                    return Err(DataFusionError::Internal(format!(
-                      "Inconsistent types in ScalarValue::iter_to_array. \
-                                         Expected Utf8, got {:?}",
-                      sv
-                    )))
-                  }
-                }
-              }
-              builder.append(true)?;
-            }
-            ScalarValue::List(None, _) => {
-              builder.append(false)?;
-            }
-            sv => {
-              return Err(DataFusionError::Internal(format!(
-                "Inconsistent types in ScalarValue::iter_to_array. \
-                             Expected List, got {:?}",
-                sv
-              )))
-            }
-          }
+            ($ARRAY_TY:ident, $SCALAR_TY:ident, $NATIVE_TYPE:ident) => {{
+                Arc::new(ListArray::from_iter_primitive::<$ARRAY_TY, _, _>(
+                    scalars.into_iter().map(|x| match x {
+                        ScalarValue::List(xs, _) => xs.map(|x| {
+                            x.iter().map(|x| match x {
+                                ScalarValue::$SCALAR_TY(i) => *i,
+                                sv => panic!(
+                                    "Inconsistent types in ScalarValue::iter_to_array. \
+                                        Expected {:?}, got {:?}",
+                                    data_type, sv
+                                ),
+                            })
+                            .collect::<Vec<Option<$NATIVE_TYPE>>>()
+                        }),
+                        sv => panic!(
+                            "Inconsistent types in ScalarValue::iter_to_array. \
+                                Expected {:?}, got {:?}",
+                            data_type, sv
+                        ),
+                    }),
+                ))
+            }};
         }
 
-        Arc::new(builder.finish())
-      }};
-    }
+        macro_rules! build_array_list_string {
+            ($BUILDER:ident, $SCALAR_TY:ident) => {{
+                let mut builder = ListBuilder::new($BUILDER::new(0));
+                for scalar in scalars.into_iter() {
+                    match scalar {
+                        ScalarValue::List(Some(xs), _) => {
+                            let xs = *xs;
+                            for s in xs {
+                                match s {
+                                    ScalarValue::$SCALAR_TY(Some(val)) => {
+                                        builder.values().append_value(val)?;
+                                    }
+                                    ScalarValue::$SCALAR_TY(None) => {
+                                        builder.values().append_null()?;
+                                    }
+                                    sv => {
+                                        return Err(DataFusionError::Internal(format!(
+                                            "Inconsistent types in ScalarValue::iter_to_array. \
+                                                Expected Utf8, got {:?}",
+                                            sv
+                                        )))
+                                    }
+                                }
+                            }
+                            builder.append(true)?;
+                        }
+                        ScalarValue::List(None, _) => {
+                            builder.append(false)?;
+                        }
+                        sv => {
+                            return Err(DataFusionError::Internal(format!(
+                                "Inconsistent types in ScalarValue::iter_to_array. \
+                                    Expected List, got {:?}",
+                                sv
+                            )))
+                        }
+                    }
+                }
+                Arc::new(builder.finish())
+            }};
+        }
 
         let array: ArrayRef = match &data_type {
             DataType::Decimal(precision, scale) => {
@@ -844,6 +846,7 @@ impl ScalarValue {
                     ScalarValue::iter_to_decimal_array(scalars, precision, scale)?;
                 Arc::new(decimal_array)
             }
+            DataType::Null => ScalarValue::iter_to_null_array(scalars),
             DataType::Boolean => build_array_primitive!(BooleanArray, Boolean),
             DataType::Float32 => build_array_primitive!(Float32Array, Float32),
             DataType::Float64 => build_array_primitive!(Float64Array, Float64),
@@ -974,6 +977,17 @@ impl ScalarValue {
         };
 
         Ok(array)
+    }
+
+    fn iter_to_null_array(scalars: impl IntoIterator<Item = ScalarValue>) -> ArrayRef {
+        let length =
+            scalars
+                .into_iter()
+                .fold(0usize, |r, element: ScalarValue| match element {
+                    ScalarValue::Null => r + 1,
+                    _ => unreachable!(),
+                });
+        new_null_array(&DataType::Null, length)
     }
 
     fn iter_to_decimal_array(
@@ -1249,6 +1263,7 @@ impl ScalarValue {
                     Arc::new(StructArray::from(field_values))
                 }
             },
+            ScalarValue::Null => new_null_array(&DataType::Null, size),
         }
     }
 
@@ -1274,6 +1289,7 @@ impl ScalarValue {
         }
 
         Ok(match array.data_type() {
+            DataType::Null => ScalarValue::Null,
             DataType::Decimal(precision, scale) => {
                 ScalarValue::get_decimal_value_from_array(array, index, precision, scale)
             }
@@ -1399,6 +1415,23 @@ impl ScalarValue {
                 }
                 Self::Struct(Some(Box::new(field_values)), Box::new(fields.clone()))
             }
+            DataType::FixedSizeList(nested_type, _len) => {
+                let list_array =
+                    array.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
+                let value = match list_array.is_null(index) {
+                    true => None,
+                    false => {
+                        let nested_array = list_array.value(index);
+                        let scalar_vec = (0..nested_array.len())
+                            .map(|i| ScalarValue::try_from_array(&nested_array, i))
+                            .collect::<Result<Vec<_>>>()?;
+                        Some(scalar_vec)
+                    }
+                };
+                let value = value.map(Box::new);
+                let data_type = Box::new(nested_type.data_type().clone());
+                ScalarValue::List(value, data_type)
+            }
             other => {
                 return Err(DataFusionError::NotImplemented(format!(
                     "Can't create a scalar from array of type \"{:?}\"",
@@ -1513,6 +1546,7 @@ impl ScalarValue {
                 eq_array_primitive!(array, index, IntervalMonthDayNanoArray, val)
             }
             ScalarValue::Struct(_, _) => unimplemented!(),
+            ScalarValue::Null => array.data().is_null(index),
         }
     }
 
@@ -1734,6 +1768,7 @@ impl TryFrom<&DataType> for ScalarValue {
             DataType::Struct(fields) => {
                 ScalarValue::Struct(None, Box::new(fields.clone()))
             }
+            DataType::Null => ScalarValue::Null,
             _ => {
                 return Err(DataFusionError::NotImplemented(format!(
                     "Can't create a scalar from data_type \"{:?}\"",
@@ -1826,6 +1861,7 @@ impl fmt::Display for ScalarValue {
                 )?,
                 None => write!(f, "NULL")?,
             },
+            ScalarValue::Null => write!(f, "NULL")?,
         };
         Ok(())
     }
@@ -1893,6 +1929,7 @@ impl fmt::Debug for ScalarValue {
                     None => write!(f, "Struct(NULL)"),
                 }
             }
+            ScalarValue::Null => write!(f, "NULL"),
         }
     }
 }

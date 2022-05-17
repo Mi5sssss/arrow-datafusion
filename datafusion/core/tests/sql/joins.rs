@@ -294,6 +294,24 @@ async fn left_join_not_null_filter_on_join_column() -> Result<()> {
 }
 
 #[tokio::test]
+async fn self_join_non_equijoin() -> Result<()> {
+    let ctx = create_join_context_with_nulls()?;
+    let sql =
+        "SELECT x.t1_id, y.t1_id FROM t1 x JOIN t1 y ON x.t1_id = 11 AND y.t1_id = 44";
+    let expected = vec![
+        "+-------+-------+",
+        "| t1_id | t1_id |",
+        "+-------+-------+",
+        "| 11    | 44    |",
+        "+-------+-------+",
+    ];
+
+    let actual = execute_to_batches(&ctx, sql).await;
+    assert_batches_eq!(expected, &actual);
+    Ok(())
+}
+
+#[tokio::test]
 async fn right_join_null_filter() -> Result<()> {
     let ctx = create_join_context_with_nulls()?;
     let sql = "SELECT t1_id, t1_name, t2_id FROM t1 RIGHT JOIN t2 ON t1_id = t2_id WHERE t1_name IS NULL ORDER BY t2_id";
@@ -811,7 +829,11 @@ async fn inner_join_nulls() {
     let sql = "SELECT * FROM (SELECT null AS id1) t1
             INNER JOIN (SELECT null AS id2) t2 ON id1 = id2";
 
-    let expected = vec!["++", "++"];
+    #[rustfmt::skip]
+    let expected = vec![
+        "++",
+        "++",
+    ];
 
     let ctx = create_join_context_qualified().unwrap();
     let actual = execute_to_batches(&ctx, sql).await;
@@ -927,6 +949,185 @@ async fn join_timestamp() -> Result<()> {
     .await;
 
     assert_batches_sorted_eq!(expected, &results);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn left_join_should_not_panic_with_empty_side() -> Result<()> {
+    let ctx = SessionContext::new();
+
+    let t1_schema = Schema::new(vec![
+        Field::new("t1_id", DataType::Int64, true),
+        Field::new("t1_value", DataType::Utf8, false),
+    ]);
+    let t1_data = RecordBatch::try_new(
+        Arc::new(t1_schema),
+        vec![
+            Arc::new(Int64Array::from_slice(&[5247, 3821, 6321, 8821, 7748])),
+            Arc::new(StringArray::from_slice(&["a", "b", "c", "d", "e"])),
+        ],
+    )?;
+    let t1_table = MemTable::try_new(t1_data.schema(), vec![vec![t1_data]])?;
+    ctx.register_table("t1", Arc::new(t1_table))?;
+
+    let t2_schema = Schema::new(vec![
+        Field::new("t2_id", DataType::Int64, true),
+        Field::new("t2_value", DataType::Boolean, true),
+    ]);
+    let t2_data = RecordBatch::try_new(
+        Arc::new(t2_schema),
+        vec![
+            Arc::new(Int64Array::from_slice(&[358, 2820, 3804, 7748])),
+            Arc::new(BooleanArray::from(vec![
+                Some(true),
+                Some(false),
+                None,
+                None,
+            ])),
+        ],
+    )?;
+    let t2_table = MemTable::try_new(t2_data.schema(), vec![vec![t2_data]])?;
+    ctx.register_table("t2", Arc::new(t2_table))?;
+
+    let expected_left_join = vec![
+        "+-------+----------+-------+----------+",
+        "| t1_id | t1_value | t2_id | t2_value |",
+        "+-------+----------+-------+----------+",
+        "| 5247  | a        |       |          |",
+        "| 3821  | b        |       |          |",
+        "| 6321  | c        |       |          |",
+        "| 8821  | d        |       |          |",
+        "| 7748  | e        | 7748  |          |",
+        "+-------+----------+-------+----------+",
+    ];
+
+    let results_left_join =
+        execute_to_batches(&ctx, "SELECT * FROM t1 LEFT JOIN t2 ON t1_id = t2_id").await;
+    assert_batches_sorted_eq!(expected_left_join, &results_left_join);
+
+    let expected_right_join = vec![
+        "+-------+----------+-------+----------+",
+        "| t2_id | t2_value | t1_id | t1_value |",
+        "+-------+----------+-------+----------+",
+        "|       |          | 3821  | b        |",
+        "|       |          | 5247  | a        |",
+        "|       |          | 6321  | c        |",
+        "|       |          | 8821  | d        |",
+        "| 7748  |          | 7748  | e        |",
+        "+-------+----------+-------+----------+",
+    ];
+
+    let result_right_join =
+        execute_to_batches(&ctx, "SELECT * FROM t2 RIGHT JOIN t1 ON t1_id = t2_id").await;
+    assert_batches_sorted_eq!(expected_right_join, &result_right_join);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn left_join_using_2() -> Result<()> {
+    let results = execute_with_partition(
+        "SELECT t1.c1, t2.c2 FROM test t1 JOIN test t2 USING (c2) ORDER BY t2.c2",
+        1,
+    )
+    .await?;
+    assert_eq!(results.len(), 1);
+
+    let expected = vec![
+        "+----+----+",
+        "| c1 | c2 |",
+        "+----+----+",
+        "| 0  | 1  |",
+        "| 0  | 2  |",
+        "| 0  | 3  |",
+        "| 0  | 4  |",
+        "| 0  | 5  |",
+        "| 0  | 6  |",
+        "| 0  | 7  |",
+        "| 0  | 8  |",
+        "| 0  | 9  |",
+        "| 0  | 10 |",
+        "+----+----+",
+    ];
+
+    assert_batches_eq!(expected, &results);
+    Ok(())
+}
+
+#[tokio::test]
+async fn left_join_using_join_key_projection() -> Result<()> {
+    let results = execute_with_partition(
+        "SELECT t1.c1, t1.c2, t2.c2 FROM test t1 JOIN test t2 USING (c2) ORDER BY t2.c2",
+        1,
+    )
+    .await?;
+    assert_eq!(results.len(), 1);
+
+    let expected = vec![
+        "+----+----+----+",
+        "| c1 | c2 | c2 |",
+        "+----+----+----+",
+        "| 0  | 1  | 1  |",
+        "| 0  | 2  | 2  |",
+        "| 0  | 3  | 3  |",
+        "| 0  | 4  | 4  |",
+        "| 0  | 5  | 5  |",
+        "| 0  | 6  | 6  |",
+        "| 0  | 7  | 7  |",
+        "| 0  | 8  | 8  |",
+        "| 0  | 9  | 9  |",
+        "| 0  | 10 | 10 |",
+        "+----+----+----+",
+    ];
+
+    assert_batches_eq!(expected, &results);
+    Ok(())
+}
+
+#[tokio::test]
+async fn left_join_2() -> Result<()> {
+    let results = execute_with_partition(
+        "SELECT t1.c1, t1.c2, t2.c2 FROM test t1 JOIN test t2 ON t1.c2 = t2.c2 ORDER BY t1.c2",
+        1,
+    )
+        .await?;
+    assert_eq!(results.len(), 1);
+
+    let expected = vec![
+        "+----+----+----+",
+        "| c1 | c2 | c2 |",
+        "+----+----+----+",
+        "| 0  | 1  | 1  |",
+        "| 0  | 2  | 2  |",
+        "| 0  | 3  | 3  |",
+        "| 0  | 4  | 4  |",
+        "| 0  | 5  | 5  |",
+        "| 0  | 6  | 6  |",
+        "| 0  | 7  | 7  |",
+        "| 0  | 8  | 8  |",
+        "| 0  | 9  | 9  |",
+        "| 0  | 10 | 10 |",
+        "+----+----+----+",
+    ];
+
+    assert_batches_eq!(expected, &results);
+    Ok(())
+}
+
+#[tokio::test]
+async fn join_partitioned() -> Result<()> {
+    // self join on partition id (workaround for duplicate column name)
+    let results = execute_with_partition(
+        "SELECT 1 FROM test JOIN (SELECT c1 AS id1 FROM test) AS a ON c1=id1",
+        4,
+    )
+    .await?;
+
+    assert_eq!(
+        results.iter().map(|b| b.num_rows()).sum::<usize>(),
+        4 * 10 * 10
+    );
 
     Ok(())
 }

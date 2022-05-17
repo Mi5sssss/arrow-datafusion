@@ -158,7 +158,7 @@
 //!
 //! * Projection: [`ProjectionExec`](physical_plan::projection::ProjectionExec)
 //! * Filter: [`FilterExec`](physical_plan::filter::FilterExec)
-//! * Hash and Grouped aggregations: [`HashAggregateExec`](physical_plan::hash_aggregate::HashAggregateExec)
+//! * Grouped and non-grouped aggregations: [`AggregateExec`](physical_plan::aggregates::AggregateExec)
 //! * Sort: [`SortExec`](physical_plan::sorts::sort::SortExec)
 //! * Coalesce partitions: [`CoalescePartitionsExec`](physical_plan::coalesce_partitions::CoalescePartitionsExec)
 //! * Limit: [`LocalLimitExec`](physical_plan::limit::LocalLimitExec) and [`GlobalLimitExec`](physical_plan::limit::GlobalLimitExec)
@@ -190,7 +190,7 @@
 //!
 //! cargo run --example csv_sql
 //!
-//! PARQUET_TEST_DATA=./parquet-testing/data cargo run --example parquet_sql
+//! cargo run --example parquet_sql
 //!
 //! cargo run --example dataframe
 //!
@@ -218,6 +218,8 @@ pub mod physical_optimizer;
 pub mod physical_plan;
 pub mod prelude;
 pub mod scalar;
+#[cfg(feature = "scheduler")]
+pub mod scheduler;
 pub mod sql;
 pub mod variable;
 
@@ -225,11 +227,16 @@ pub mod variable;
 pub use arrow;
 pub use parquet;
 
-// re-export object store dependencies
+// re-export DataFusion crates
+pub use datafusion_common as common;
 pub use datafusion_data_access;
+pub use datafusion_expr as logical_expr;
+pub use datafusion_physical_expr as physical_expr;
 
-#[cfg(feature = "row")]
-pub mod row;
+pub use datafusion_row as row;
+
+#[cfg(feature = "jit")]
+pub use datafusion_jit as jit;
 
 pub mod from_slice;
 

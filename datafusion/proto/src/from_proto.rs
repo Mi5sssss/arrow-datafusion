@@ -27,19 +27,17 @@ use datafusion::prelude::bit_length;
 use datafusion::{
     arrow::datatypes::{DataType, Field, IntervalUnit, Schema, TimeUnit, UnionMode},
     error::DataFusionError,
+    logical_expr::{BuiltInWindowFunction, BuiltinScalarFunction},
     logical_plan::{
         abs, acos, ascii, asin, atan, ceil, character_length, chr, concat_expr,
         concat_ws_expr, cos, digest, exp, floor, left, ln, log10, log2, now_expr, nullif,
-        random, regexp_replace, repeat, replace, reverse, right, round, signum, sin,
-        split_part, sqrt, starts_with, strpos, substr, tan, to_hex, to_timestamp_micros,
-        to_timestamp_millis, to_timestamp_seconds, translate, trunc,
+        power, random, regexp_replace, repeat, replace, reverse, right, round, signum,
+        sin, split_part, sqrt, starts_with, strpos, substr, tan, to_hex,
+        to_timestamp_micros, to_timestamp_millis, to_timestamp_seconds, translate, trunc,
         window_frames::{WindowFrame, WindowFrameBound, WindowFrameUnits},
         Column, DFField, DFSchema, DFSchemaRef, Expr, Operator,
     },
-    physical_plan::{
-        aggregates::AggregateFunction, functions::BuiltinScalarFunction,
-        window_functions::BuiltInWindowFunction,
-    },
+    physical_plan::aggregates::AggregateFunction,
     prelude::{
         array, btrim, coalesce, date_part, date_trunc, lower, lpad, ltrim, md5,
         octet_length, regexp_match, rpad, rtrim, sha224, sha256, sha384, sha512, trim,
@@ -468,6 +466,8 @@ impl From<&protobuf::ScalarFunction> for BuiltinScalarFunction {
             ScalarFunction::Translate => Self::Translate,
             ScalarFunction::RegexpMatch => Self::RegexpMatch,
             ScalarFunction::Coalesce => Self::Coalesce,
+            ScalarFunction::Power => Self::Power,
+            ScalarFunction::StructFun => Self::Struct,
         }
     }
 }
@@ -496,6 +496,7 @@ impl From<protobuf::AggregateFunction> for AggregateFunction {
                 Self::ApproxPercentileContWithWeight
             }
             protobuf::AggregateFunction::ApproxMedian => Self::ApproxMedian,
+            protobuf::AggregateFunction::Grouping => Self::Grouping,
         }
     }
 }
@@ -914,7 +915,7 @@ pub fn parse_expr(
     proto: &protobuf::LogicalExprNode,
     registry: &dyn FunctionRegistry,
 ) -> Result<Expr, Error> {
-    use datafusion::physical_plan::window_functions;
+    use datafusion::logical_expr::window_function;
     use protobuf::{logical_expr_node::ExprType, window_expr_node, ScalarFunction};
 
     let expr_type = proto
@@ -970,7 +971,7 @@ pub fn parse_expr(
                     let aggr_function = protobuf::AggregateFunction::try_from(i)?.into();
 
                     Ok(Expr::WindowFunction {
-                        fun: window_functions::WindowFunction::AggregateFunction(
+                        fun: window_function::WindowFunction::AggregateFunction(
                             aggr_function,
                         ),
                         args: vec![parse_required_expr(&expr.expr, registry, "expr")?],
@@ -985,7 +986,7 @@ pub fn parse_expr(
                         .into();
 
                     Ok(Expr::WindowFunction {
-                        fun: window_functions::WindowFunction::BuiltInWindowFunction(
+                        fun: window_function::WindowFunction::BuiltInWindowFunction(
                             built_in_function,
                         ),
                         args: vec![parse_required_expr(&expr.expr, registry, "expr")?],
@@ -1244,6 +1245,10 @@ pub fn parse_expr(
                         .iter()
                         .map(|expr| parse_expr(expr, registry))
                         .collect::<Result<Vec<_>, _>>()?,
+                )),
+                ScalarFunction::Power => Ok(power(
+                    parse_expr(&args[0], registry)?,
+                    parse_expr(&args[1], registry)?,
                 )),
                 _ => Err(proto_error(
                     "Protobuf deserialization error: Unsupported scalar function",

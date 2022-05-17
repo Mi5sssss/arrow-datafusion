@@ -32,9 +32,9 @@ use datafusion::logical_plan::plan::{
     Aggregate, EmptyRelation, Filter, Join, Projection, Sort, SubqueryAlias, Window,
 };
 use datafusion::logical_plan::{
-    Column, CreateCatalog, CreateCatalogSchema, CreateExternalTable, CrossJoin, Expr,
-    JoinConstraint, Limit, LogicalPlan, LogicalPlanBuilder, Repartition, TableScan,
-    Values,
+    source_as_provider, Column, CreateCatalog, CreateCatalogSchema, CreateExternalTable,
+    CreateView, CrossJoin, Expr, JoinConstraint, Limit, LogicalPlan, LogicalPlanBuilder,
+    Repartition, TableScan, Values,
 };
 use datafusion::prelude::SessionContext;
 
@@ -334,6 +334,19 @@ impl AsLogicalPlan for LogicalPlanNode {
                     if_not_exists: create_extern_table.if_not_exists,
                 }))
             }
+            LogicalPlanType::CreateView(create_view) => {
+                let plan = create_view
+                    .input.clone().ok_or_else(|| BallistaError::General(String::from(
+                        "Protobuf deserialization error, CreateViewNode has invalid LogicalPlan input.",
+                    )))?
+                    .try_into_logical_plan(ctx, extension_codec)?;
+
+                Ok(LogicalPlan::CreateView(CreateView {
+                    name: create_view.name.clone(),
+                    input: Arc::new(plan),
+                    or_replace: create_view.or_replace,
+                }))
+            }
             LogicalPlanType::CreateCatalogSchema(create_catalog_schema) => {
                 let pb_schema = (create_catalog_schema.schema.clone()).ok_or_else(|| {
                     BallistaError::General(String::from(
@@ -510,6 +523,7 @@ impl AsLogicalPlan for LogicalPlanNode {
                 projection,
                 ..
             }) => {
+                let source = source_as_provider(source)?;
                 let schema = source.schema();
                 let source = source.as_any();
 
@@ -707,6 +721,14 @@ impl AsLogicalPlan for LogicalPlanNode {
                     ))),
                 })
             }
+            LogicalPlan::Subquery(_) => {
+                // note that the ballista and datafusion proto files need refactoring to allow
+                // LogicalExprNode to reference a LogicalPlanNode
+                // see https://github.com/apache/arrow-datafusion/issues/2338
+                Err(BallistaError::NotImplemented(
+                    "Ballista does not support subqueries".to_string(),
+                ))
+            }
             LogicalPlan::SubqueryAlias(SubqueryAlias { input, alias, .. }) => {
                 let input: protobuf::LogicalPlanNode =
                     protobuf::LogicalPlanNode::try_from_logical_plan(
@@ -818,7 +840,7 @@ impl AsLogicalPlan for LogicalPlanNode {
                 table_partition_cols,
                 if_not_exists,
             }) => {
-                use datafusion::sql::parser::FileType;
+                use datafusion::logical_plan::FileType;
 
                 let pb_file_type: protobuf::FileType = match file_type {
                     FileType::NdJson => protobuf::FileType::NdJson,
@@ -842,6 +864,22 @@ impl AsLogicalPlan for LogicalPlanNode {
                     )),
                 })
             }
+            LogicalPlan::CreateView(CreateView {
+                name,
+                input,
+                or_replace,
+            }) => Ok(protobuf::LogicalPlanNode {
+                logical_plan_type: Some(LogicalPlanType::CreateView(Box::new(
+                    protobuf::CreateViewNode {
+                        name: name.clone(),
+                        input: Some(Box::new(LogicalPlanNode::try_from_logical_plan(
+                            input,
+                            extension_codec,
+                        )?)),
+                        or_replace: *or_replace,
+                    },
+                ))),
+            }),
             LogicalPlan::CreateCatalogSchema(CreateCatalogSchema {
                 schema_name,
                 if_not_exists,
@@ -978,27 +1016,24 @@ macro_rules! into_logical_plan {
 mod roundtrip_tests {
 
     use super::super::{super::error::Result, protobuf};
-    use crate::error::BallistaError;
     use crate::serde::{AsLogicalPlan, BallistaCodec};
     use async_trait::async_trait;
     use core::panic;
+    use datafusion::common::DFSchemaRef;
+    use datafusion::logical_plan::source_as_provider;
     use datafusion::{
         arrow::datatypes::{DataType, Field, Schema},
         datafusion_data_access::{
             self,
-            object_store::{
-                local::LocalFileSystem, FileMetaStream, ListEntryStream, ObjectReader,
-                ObjectStore,
-            },
+            object_store::{FileMetaStream, ListEntryStream, ObjectReader, ObjectStore},
             SizedFile,
         },
         datasource::listing::ListingTable,
         logical_plan::{
-            col, CreateExternalTable, Expr, LogicalPlan, LogicalPlanBuilder, Repartition,
-            ToDFSchema,
+            col, CreateExternalTable, Expr, FileType, LogicalPlan, LogicalPlanBuilder,
+            Repartition, ToDFSchema,
         },
         prelude::*,
-        sql::parser::FileType,
     };
     use std::io;
     use std::sync::Arc;
@@ -1104,26 +1139,11 @@ mod roundtrip_tests {
         let test_expr: Vec<Expr> =
             vec![col("c1") + col("c2"), Expr::Literal((4.0).into())];
 
-        let schema = Schema::new(vec![
-            Field::new("id", DataType::Int32, false),
-            Field::new("first_name", DataType::Utf8, false),
-            Field::new("last_name", DataType::Utf8, false),
-            Field::new("state", DataType::Utf8, false),
-            Field::new("salary", DataType::Int32, false),
-        ]);
-
         let plan = std::sync::Arc::new(
-            LogicalPlanBuilder::scan_csv(
-                Arc::new(LocalFileSystem {}),
-                "employee.csv",
-                CsvReadOptions::new().schema(&schema).has_header(true),
-                Some(vec![3, 4]),
-                4,
-            )
-            .await
-            .and_then(|plan| plan.sort(vec![col("salary")]))
-            .and_then(|plan| plan.build())
-            .map_err(BallistaError::DataFusionError)?,
+            test_scan_csv("employee.csv", Some(vec![3, 4]))
+                .await?
+                .sort(vec![col("salary")])?
+                .build()?,
         );
 
         for partition_count in test_partition_counts.iter() {
@@ -1160,13 +1180,7 @@ mod roundtrip_tests {
 
     #[test]
     fn roundtrip_create_external_table() -> Result<()> {
-        let schema = Schema::new(vec![
-            Field::new("id", DataType::Int32, false),
-            Field::new("first_name", DataType::Utf8, false),
-            Field::new("last_name", DataType::Utf8, false),
-            Field::new("state", DataType::Utf8, false),
-            Field::new("salary", DataType::Int32, false),
-        ]);
+        let schema = test_schema();
 
         let df_schema_ref = schema.to_dfschema_ref()?;
 
@@ -1198,39 +1212,17 @@ mod roundtrip_tests {
 
     #[tokio::test]
     async fn roundtrip_analyze() -> Result<()> {
-        let schema = Schema::new(vec![
-            Field::new("id", DataType::Int32, false),
-            Field::new("first_name", DataType::Utf8, false),
-            Field::new("last_name", DataType::Utf8, false),
-            Field::new("state", DataType::Utf8, false),
-            Field::new("salary", DataType::Int32, false),
-        ]);
+        let verbose_plan = test_scan_csv("employee.csv", Some(vec![3, 4]))
+            .await?
+            .sort(vec![col("salary")])?
+            .explain(true, true)?
+            .build()?;
 
-        let verbose_plan = LogicalPlanBuilder::scan_csv(
-            Arc::new(LocalFileSystem {}),
-            "employee.csv",
-            CsvReadOptions::new().schema(&schema).has_header(true),
-            Some(vec![3, 4]),
-            4,
-        )
-        .await
-        .and_then(|plan| plan.sort(vec![col("salary")]))
-        .and_then(|plan| plan.explain(true, true))
-        .and_then(|plan| plan.build())
-        .map_err(BallistaError::DataFusionError)?;
-
-        let plan = LogicalPlanBuilder::scan_csv(
-            Arc::new(LocalFileSystem {}),
-            "employee.csv",
-            CsvReadOptions::new().schema(&schema).has_header(true),
-            Some(vec![3, 4]),
-            4,
-        )
-        .await
-        .and_then(|plan| plan.sort(vec![col("salary")]))
-        .and_then(|plan| plan.explain(false, true))
-        .and_then(|plan| plan.build())
-        .map_err(BallistaError::DataFusionError)?;
+        let plan = test_scan_csv("employee.csv", Some(vec![3, 4]))
+            .await?
+            .sort(vec![col("salary")])?
+            .explain(false, true)?
+            .build()?;
 
         roundtrip_test!(plan);
 
@@ -1241,39 +1233,17 @@ mod roundtrip_tests {
 
     #[tokio::test]
     async fn roundtrip_explain() -> Result<()> {
-        let schema = Schema::new(vec![
-            Field::new("id", DataType::Int32, false),
-            Field::new("first_name", DataType::Utf8, false),
-            Field::new("last_name", DataType::Utf8, false),
-            Field::new("state", DataType::Utf8, false),
-            Field::new("salary", DataType::Int32, false),
-        ]);
+        let verbose_plan = test_scan_csv("employee.csv", Some(vec![3, 4]))
+            .await?
+            .sort(vec![col("salary")])?
+            .explain(true, false)?
+            .build()?;
 
-        let verbose_plan = LogicalPlanBuilder::scan_csv(
-            Arc::new(LocalFileSystem {}),
-            "employee.csv",
-            CsvReadOptions::new().schema(&schema).has_header(true),
-            Some(vec![3, 4]),
-            4,
-        )
-        .await
-        .and_then(|plan| plan.sort(vec![col("salary")]))
-        .and_then(|plan| plan.explain(true, false))
-        .and_then(|plan| plan.build())
-        .map_err(BallistaError::DataFusionError)?;
-
-        let plan = LogicalPlanBuilder::scan_csv(
-            Arc::new(LocalFileSystem {}),
-            "employee.csv",
-            CsvReadOptions::new().schema(&schema).has_header(true),
-            Some(vec![3, 4]),
-            4,
-        )
-        .await
-        .and_then(|plan| plan.sort(vec![col("salary")]))
-        .and_then(|plan| plan.explain(false, false))
-        .and_then(|plan| plan.build())
-        .map_err(BallistaError::DataFusionError)?;
+        let plan = test_scan_csv("employee.csv", Some(vec![3, 4]))
+            .await?
+            .sort(vec![col("salary")])?
+            .explain(false, false)?
+            .build()?;
 
         roundtrip_test!(plan);
 
@@ -1284,36 +1254,14 @@ mod roundtrip_tests {
 
     #[tokio::test]
     async fn roundtrip_join() -> Result<()> {
-        let schema = Schema::new(vec![
-            Field::new("id", DataType::Int32, false),
-            Field::new("first_name", DataType::Utf8, false),
-            Field::new("last_name", DataType::Utf8, false),
-            Field::new("state", DataType::Utf8, false),
-            Field::new("salary", DataType::Int32, false),
-        ]);
+        let scan_plan = test_scan_csv("employee1", Some(vec![0, 3, 4]))
+            .await?
+            .build()?;
 
-        let scan_plan = LogicalPlanBuilder::scan_csv(
-            Arc::new(LocalFileSystem {}),
-            "employee1",
-            CsvReadOptions::new().schema(&schema).has_header(true),
-            Some(vec![0, 3, 4]),
-            4,
-        )
-        .await?
-        .build()
-        .map_err(BallistaError::DataFusionError)?;
-
-        let plan = LogicalPlanBuilder::scan_csv(
-            Arc::new(LocalFileSystem {}),
-            "employee2",
-            CsvReadOptions::new().schema(&schema).has_header(true),
-            Some(vec![0, 3, 4]),
-            4,
-        )
-        .await
-        .and_then(|plan| plan.join(&scan_plan, JoinType::Inner, (vec!["id"], vec!["id"])))
-        .and_then(|plan| plan.build())
-        .map_err(BallistaError::DataFusionError)?;
+        let plan = test_scan_csv("employee2", Some(vec![0, 3, 4]))
+            .await?
+            .join(&scan_plan, JoinType::Inner, (vec!["id"], vec!["id"]))?
+            .build()?;
 
         roundtrip_test!(plan);
         Ok(())
@@ -1321,25 +1269,10 @@ mod roundtrip_tests {
 
     #[tokio::test]
     async fn roundtrip_sort() -> Result<()> {
-        let schema = Schema::new(vec![
-            Field::new("id", DataType::Int32, false),
-            Field::new("first_name", DataType::Utf8, false),
-            Field::new("last_name", DataType::Utf8, false),
-            Field::new("state", DataType::Utf8, false),
-            Field::new("salary", DataType::Int32, false),
-        ]);
-
-        let plan = LogicalPlanBuilder::scan_csv(
-            Arc::new(LocalFileSystem {}),
-            "employee.csv",
-            CsvReadOptions::new().schema(&schema).has_header(true),
-            Some(vec![3, 4]),
-            4,
-        )
-        .await
-        .and_then(|plan| plan.sort(vec![col("salary")]))
-        .and_then(|plan| plan.build())
-        .map_err(BallistaError::DataFusionError)?;
+        let plan = test_scan_csv("employee.csv", Some(vec![3, 4]))
+            .await?
+            .sort(vec![col("salary")])?
+            .build()?;
         roundtrip_test!(plan);
 
         Ok(())
@@ -1347,15 +1280,11 @@ mod roundtrip_tests {
 
     #[tokio::test]
     async fn roundtrip_empty_relation() -> Result<()> {
-        let plan_false = LogicalPlanBuilder::empty(false)
-            .build()
-            .map_err(BallistaError::DataFusionError)?;
+        let plan_false = LogicalPlanBuilder::empty(false).build()?;
 
         roundtrip_test!(plan_false);
 
-        let plan_true = LogicalPlanBuilder::empty(true)
-            .build()
-            .map_err(BallistaError::DataFusionError)?;
+        let plan_true = LogicalPlanBuilder::empty(true).build()?;
 
         roundtrip_test!(plan_true);
 
@@ -1364,31 +1293,17 @@ mod roundtrip_tests {
 
     #[tokio::test]
     async fn roundtrip_logical_plan() -> Result<()> {
-        let schema = Schema::new(vec![
-            Field::new("id", DataType::Int32, false),
-            Field::new("first_name", DataType::Utf8, false),
-            Field::new("last_name", DataType::Utf8, false),
-            Field::new("state", DataType::Utf8, false),
-            Field::new("salary", DataType::Int32, false),
-        ]);
-
-        let plan = LogicalPlanBuilder::scan_csv(
-            Arc::new(LocalFileSystem {}),
-            "employee.csv",
-            CsvReadOptions::new().schema(&schema).has_header(true),
-            Some(vec![3, 4]),
-            4,
-        )
-        .await
-        .and_then(|plan| plan.aggregate(vec![col("state")], vec![max(col("salary"))]))
-        .and_then(|plan| plan.build())
-        .map_err(BallistaError::DataFusionError)?;
+        let plan = test_scan_csv("employee.csv", Some(vec![3, 4]))
+            .await?
+            .aggregate(vec![col("state")], vec![max(col("salary"))])?
+            .build()?;
 
         roundtrip_test!(plan);
 
         Ok(())
     }
 
+    #[ignore] // see https://github.com/apache/arrow-datafusion/issues/2546
     #[tokio::test]
     async fn roundtrip_logical_plan_custom_ctx() -> Result<()> {
         let ctx = SessionContext::new();
@@ -1398,28 +1313,18 @@ mod roundtrip_tests {
         ctx.runtime_env()
             .register_object_store("test", custom_object_store.clone());
 
-        let (os, _) = ctx.runtime_env().object_store("test://foo.csv")?;
+        let (os, uri) = ctx.runtime_env().object_store("test://foo.csv")?;
+        assert_eq!("TestObjectStore", &format!("{:?}", os));
+        assert_eq!("foo.csv", uri);
 
-        println!("Object Store {:?}", os);
-
-        let schema = Schema::new(vec![
-            Field::new("id", DataType::Int32, false),
-            Field::new("first_name", DataType::Utf8, false),
-            Field::new("last_name", DataType::Utf8, false),
-            Field::new("state", DataType::Utf8, false),
-            Field::new("salary", DataType::Int32, false),
-        ]);
-
-        let plan = LogicalPlanBuilder::scan_csv(
-            custom_object_store.clone(),
-            "test://employee.csv",
-            CsvReadOptions::new().schema(&schema).has_header(true),
-            Some(vec![3, 4]),
-            4,
-        )
-        .await
-        .and_then(|plan| plan.build())
-        .map_err(BallistaError::DataFusionError)?;
+        let schema = test_schema();
+        let plan = ctx
+            .read_csv(
+                "test://employee.csv",
+                CsvReadOptions::new().schema(&schema).has_header(true),
+            )
+            .await?
+            .to_logical_plan()?;
 
         let proto: protobuf::LogicalPlanNode =
             protobuf::LogicalPlanNode::try_from_logical_plan(
@@ -1435,7 +1340,8 @@ mod roundtrip_tests {
 
         let round_trip_store = match round_trip {
             LogicalPlan::TableScan(scan) => {
-                match scan.source.as_ref().as_any().downcast_ref::<ListingTable>() {
+                let source = source_as_provider(&scan.source)?;
+                match source.as_ref().as_any().downcast_ref::<ListingTable>() {
                     Some(listing_table) => {
                         format!("{:?}", listing_table.object_store())
                     }
@@ -1448,5 +1354,37 @@ mod roundtrip_tests {
         assert_eq!(round_trip_store, format!("{:?}", custom_object_store));
 
         Ok(())
+    }
+
+    fn test_schema() -> Schema {
+        Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("first_name", DataType::Utf8, false),
+            Field::new("last_name", DataType::Utf8, false),
+            Field::new("state", DataType::Utf8, false),
+            Field::new("salary", DataType::Int32, false),
+        ])
+    }
+
+    async fn test_scan_csv(
+        table_name: &str,
+        projection: Option<Vec<usize>>,
+    ) -> Result<LogicalPlanBuilder> {
+        let schema = test_schema();
+        let ctx = SessionContext::new();
+        let options = CsvReadOptions::new().schema(&schema);
+        let df = ctx.read_csv(table_name, options).await?;
+        let plan = match df.to_logical_plan()? {
+            LogicalPlan::TableScan(ref scan) => {
+                let mut scan = scan.clone();
+                scan.projection = projection;
+                let mut projected_schema = scan.projected_schema.as_ref().clone();
+                projected_schema = projected_schema.replace_qualifier(table_name);
+                scan.projected_schema = DFSchemaRef::new(projected_schema);
+                LogicalPlan::TableScan(scan)
+            }
+            _ => unimplemented!(),
+        };
+        Ok(LogicalPlanBuilder::from(plan))
     }
 }

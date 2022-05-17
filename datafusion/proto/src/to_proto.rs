@@ -34,15 +34,12 @@ use datafusion::{
     arrow::datatypes::{
         DataType, Field, IntervalUnit, Schema, SchemaRef, TimeUnit, UnionMode,
     },
+    logical_expr::{BuiltInWindowFunction, BuiltinScalarFunction, WindowFunction},
     logical_plan::{
         window_frames::{WindowFrame, WindowFrameBound, WindowFrameUnits},
         Column, DFField, DFSchemaRef, Expr,
     },
-    physical_plan::{
-        aggregates::AggregateFunction,
-        functions::BuiltinScalarFunction,
-        window_functions::{BuiltInWindowFunction, WindowFunction},
-    },
+    physical_plan::aggregates::AggregateFunction,
     scalar::ScalarValue,
 };
 
@@ -359,6 +356,7 @@ impl From<&AggregateFunction> for protobuf::AggregateFunction {
                 Self::ApproxPercentileContWithWeight
             }
             AggregateFunction::ApproxMedian => Self::ApproxMedian,
+            AggregateFunction::Grouping => Self::Grouping,
         }
     }
 }
@@ -544,6 +542,7 @@ impl TryFrom<&Expr> for protobuf::LogicalExprNode {
                     AggregateFunction::ApproxMedian => {
                         protobuf::AggregateFunction::ApproxMedian
                     }
+                    AggregateFunction::Grouping => protobuf::AggregateFunction::Grouping,
                 };
 
                 let aggregate_expr = protobuf::AggregateExprNode {
@@ -1072,6 +1071,8 @@ impl TryFrom<&BuiltinScalarFunction> for protobuf::ScalarFunction {
             BuiltinScalarFunction::Translate => Self::Translate,
             BuiltinScalarFunction::RegexpMatch => Self::RegexpMatch,
             BuiltinScalarFunction::Coalesce => Self::Coalesce,
+            BuiltinScalarFunction::Power => Self::Power,
+            BuiltinScalarFunction::Struct => Self::StructFun,
         };
 
         Ok(scalar_function)

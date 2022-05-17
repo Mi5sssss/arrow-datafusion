@@ -16,6 +16,7 @@
 // under the License.
 
 use super::*;
+use datafusion::physical_plan::display::DisplayableExecutionPlan;
 
 #[tokio::test]
 async fn explain_analyze_baseline_metrics() {
@@ -50,12 +51,12 @@ async fn explain_analyze_baseline_metrics() {
 
     assert_metrics!(
         &formatted,
-        "HashAggregateExec: mode=Partial, gby=[]",
+        "AggregateExec: mode=Partial, gby=[]",
         "metrics=[output_rows=3, elapsed_compute="
     );
     assert_metrics!(
         &formatted,
-        "HashAggregateExec: mode=FinalPartitioned, gby=[c1@0 as c1]",
+        "AggregateExec: mode=FinalPartitioned, gby=[c1@0 as c1]",
         "metrics=[output_rows=5, elapsed_compute="
     );
     assert_metrics!(
@@ -109,7 +110,7 @@ async fn explain_analyze_baseline_metrics() {
         use datafusion::physical_plan::sorts;
 
         plan.as_any().downcast_ref::<sorts::sort::SortExec>().is_some()
-            || plan.as_any().downcast_ref::<physical_plan::hash_aggregate::HashAggregateExec>().is_some()
+            || plan.as_any().downcast_ref::<physical_plan::aggregates::AggregateExec>().is_some()
             // CoalescePartitionsExec doesn't do any work so is not included
             || plan.as_any().downcast_ref::<physical_plan::filter::FilterExec>().is_some()
             || plan.as_any().downcast_ref::<physical_plan::limit::GlobalLimitExec>().is_some()
@@ -136,8 +137,16 @@ async fn explain_analyze_baseline_metrics() {
             }
             let metrics = plan.metrics().unwrap().aggregate_by_partition();
 
-            assert!(metrics.output_rows().unwrap() > 0);
-            assert!(metrics.elapsed_compute().unwrap() > 0);
+            assert!(
+                metrics.output_rows().unwrap() > 0,
+                "plan: {}",
+                DisplayableExecutionPlan::with_metrics(plan).one_line()
+            );
+            assert!(
+                metrics.elapsed_compute().unwrap() > 0,
+                "plan: {}",
+                DisplayableExecutionPlan::with_metrics(plan).one_line()
+            );
 
             let mut saw_start = false;
             let mut saw_end = false;
@@ -651,10 +660,10 @@ async fn test_physical_plan_display_indent() {
         "  SortExec: [the_min@2 DESC]",
         "    CoalescePartitionsExec",
         "      ProjectionExec: expr=[c1@0 as c1, MAX(aggregate_test_100.c12)@1 as MAX(aggregate_test_100.c12), MIN(aggregate_test_100.c12)@2 as the_min]",
-        "        HashAggregateExec: mode=FinalPartitioned, gby=[c1@0 as c1], aggr=[MAX(aggregate_test_100.c12), MIN(aggregate_test_100.c12)]",
+        "        AggregateExec: mode=FinalPartitioned, gby=[c1@0 as c1], aggr=[MAX(aggregate_test_100.c12), MIN(aggregate_test_100.c12)]",
         "          CoalesceBatchesExec: target_batch_size=4096",
         "            RepartitionExec: partitioning=Hash([Column { name: \"c1\", index: 0 }], 3)",
-        "              HashAggregateExec: mode=Partial, gby=[c1@0 as c1], aggr=[MAX(aggregate_test_100.c12), MIN(aggregate_test_100.c12)]",
+        "              AggregateExec: mode=Partial, gby=[c1@0 as c1], aggr=[MAX(aggregate_test_100.c12), MIN(aggregate_test_100.c12)]",
         "                CoalesceBatchesExec: target_batch_size=4096",
         "                  FilterExec: c12@1 < CAST(10 AS Float64)",
         "                    RepartitionExec: partitioning=RoundRobinBatch(3)",

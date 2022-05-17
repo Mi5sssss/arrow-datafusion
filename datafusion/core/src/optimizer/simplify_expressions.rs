@@ -26,13 +26,13 @@ use crate::logical_plan::{
 };
 use crate::optimizer::optimizer::OptimizerRule;
 use crate::optimizer::utils;
-use crate::physical_plan::functions::Volatility;
 use crate::physical_plan::planner::create_physical_expr;
 use crate::scalar::ScalarValue;
 use crate::{error::Result, logical_plan::Operator};
 use arrow::array::new_null_array;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use datafusion_expr::Volatility;
 
 /// Provides simplification information based on schema and properties
 pub(crate) struct SimplifyContext<'a, 'b> {
@@ -294,7 +294,7 @@ impl<'a> ExprRewriter for ConstEvaluator<'a> {
 
         // if this expr is not ok to evaluate, mark entire parent
         // stack as not ok (as all parents have at least one child or
-        // descendant that is non evaluateable
+        // descendant that can not be evaluated
 
         if !Self::can_evaluate(expr) {
             // walk back up stack, marking first parent that is not mutable
@@ -375,8 +375,12 @@ impl<'a> ConstEvaluator<'a> {
             | Expr::AggregateUDF { .. }
             | Expr::ScalarVariable(_, _)
             | Expr::Column(_)
+            | Expr::Exists { .. }
+            | Expr::InSubquery { .. }
+            | Expr::ScalarSubquery(_)
             | Expr::WindowFunction { .. }
             | Expr::Sort { .. }
+            | Expr::GroupingSet(_)
             | Expr::Wildcard
             | Expr::QualifiedWildcard { .. } => false,
             Expr::ScalarFunction { fun, .. } => Self::volatility_ok(fun.volatility()),
@@ -735,6 +739,7 @@ mod tests {
 
     use arrow::array::{ArrayRef, Int32Array};
     use chrono::{DateTime, TimeZone, Utc};
+    use datafusion_expr::{BuiltinScalarFunction, ExprSchemable};
 
     use super::*;
     use crate::assert_contains;
@@ -742,7 +747,7 @@ mod tests {
         and, binary_expr, call_fn, col, create_udf, lit, lit_timestamp_nano, DFField,
         Expr, LogicalPlanBuilder,
     };
-    use crate::physical_plan::functions::{make_scalar_function, BuiltinScalarFunction};
+    use crate::physical_plan::functions::make_scalar_function;
     use crate::physical_plan::udf::ScalarUDF;
 
     #[test]
@@ -1899,6 +1904,38 @@ mod tests {
         // expression down to a single constant (true)
         let expected = "Filter: Boolean(true) AS CAST(now() AS Int64) < CAST(totimestamp(Utf8(\"2020-09-08T12:05:00+00:00\")) AS Int64) + Int32(50000)\
                         \n  TableScan: test projection=None";
+        let actual = get_optimized_plan_formatted(&plan, &time);
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn select_date_plus_interval() {
+        let table_scan = test_table_scan();
+
+        let ts_string = "2020-09-08T12:05:00+00:00";
+        let time = chrono::Utc.timestamp_nanos(1599566400000000000i64);
+
+        //  now() < cast(to_timestamp(...) as int) + 5000000000
+        let schema = table_scan.schema();
+
+        let date_plus_interval_expr = to_timestamp_expr(ts_string)
+            .cast_to(&DataType::Date32, schema)
+            .unwrap()
+            + Expr::Literal(ScalarValue::IntervalDayTime(Some(123)));
+
+        let plan = LogicalPlanBuilder::from(table_scan.clone())
+            .project(vec![date_plus_interval_expr])
+            .unwrap()
+            .build()
+            .unwrap();
+
+        println!("{:?}", plan);
+
+        // Note that constant folder runs and folds the entire
+        // expression down to a single constant (true)
+        let expected = "Projection: Date32(\"18636\") AS CAST(totimestamp(Utf8(\"2020-09-08T12:05:00+00:00\")) AS Date32) + IntervalDayTime(\"123\")\
+            \n  TableScan: test projection=None";
         let actual = get_optimized_plan_formatted(&plan, &time);
 
         assert_eq!(expected, actual);

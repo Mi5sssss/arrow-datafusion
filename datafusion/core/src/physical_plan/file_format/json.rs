@@ -16,7 +16,7 @@
 // under the License.
 
 //! Execution plan for reading line-delimited JSON files
-use async_trait::async_trait;
+use arrow::json::reader::DecoderOptions;
 
 use crate::error::{DataFusionError, Result};
 use crate::execution::context::SessionState;
@@ -57,7 +57,6 @@ impl NdJsonExec {
     }
 }
 
-#[async_trait]
 impl ExecutionPlan for NdJsonExec {
     fn as_any(&self) -> &dyn Any {
         self
@@ -90,7 +89,7 @@ impl ExecutionPlan for NdJsonExec {
         Ok(self)
     }
 
-    async fn execute(
+    fn execute(
         &self,
         partition: usize,
         context: Arc<TaskContext>,
@@ -102,12 +101,19 @@ impl ExecutionPlan for NdJsonExec {
 
         // The json reader cannot limit the number of records, so `remaining` is ignored.
         let fun = move |file, _remaining: &Option<usize>| {
-            Box::new(json::Reader::new(
-                file,
-                Arc::clone(&file_schema),
-                batch_size,
-                proj.clone(),
-            )) as BatchIter
+            // TODO: make DecoderOptions implement Clone so we can
+            // clone here rather than recreating the options each time
+            // https://github.com/apache/arrow-rs/issues/1580
+            let options = DecoderOptions::new().with_batch_size(batch_size);
+
+            let options = if let Some(proj) = proj.clone() {
+                options.with_projection(proj)
+            } else {
+                options
+            };
+
+            Box::new(json::Reader::new(file, Arc::clone(&file_schema), options))
+                as BatchIter
         };
 
         Ok(Box::pin(FileStream::new(
@@ -160,7 +166,7 @@ pub async fn plan_to_json(
                 let file = fs::File::create(path)?;
                 let mut writer = json::LineDelimitedWriter::new(file);
                 let task_ctx = Arc::new(TaskContext::from(state));
-                let stream = plan.execute(i, task_ctx).await?;
+                let stream = plan.execute(i, task_ctx)?;
                 let handle: JoinHandle<Result<()>> = task::spawn(async move {
                     stream
                         .map(|batch| writer.write(batch?))
@@ -247,7 +253,7 @@ mod tests {
             &DataType::Utf8
         );
 
-        let mut it = exec.execute(0, task_ctx).await?;
+        let mut it = exec.execute(0, task_ctx)?;
         let batch = it.next().await.unwrap()?;
 
         assert_eq!(batch.num_rows(), 3);
@@ -288,7 +294,7 @@ mod tests {
             table_partition_cols: vec![],
         });
 
-        let mut it = exec.execute(0, task_ctx).await?;
+        let mut it = exec.execute(0, task_ctx)?;
         let batch = it.next().await.unwrap()?;
 
         assert_eq!(batch.num_rows(), 3);
@@ -327,7 +333,7 @@ mod tests {
         inferred_schema.field_with_name("c").unwrap();
         inferred_schema.field_with_name("d").unwrap_err();
 
-        let mut it = exec.execute(0, task_ctx).await?;
+        let mut it = exec.execute(0, task_ctx)?;
         let batch = it.next().await.unwrap()?;
 
         assert_eq!(batch.num_rows(), 4);

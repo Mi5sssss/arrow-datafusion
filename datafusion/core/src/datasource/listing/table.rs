@@ -23,6 +23,14 @@ use arrow::datatypes::{Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use futures::StreamExt;
 
+use crate::datasource::{
+    file_format::{
+        avro::AvroFormat, csv::CsvFormat, json::JsonFormat, parquet::ParquetFormat,
+        FileFormat,
+    },
+    get_statistics_with_limit, TableProvider, TableType,
+};
+use crate::logical_expr::TableProviderFilterPushDown;
 use crate::{
     error::{DataFusionError, Result},
     logical_plan::Expr,
@@ -31,15 +39,6 @@ use crate::{
         file_format::{FileScanConfig, DEFAULT_PARTITION_COLUMN_DATATYPE},
         project_schema, ExecutionPlan, Statistics,
     },
-};
-
-use crate::datasource::{
-    datasource::TableProviderFilterPushDown,
-    file_format::{
-        avro::AvroFormat, csv::CsvFormat, json::JsonFormat, parquet::ParquetFormat,
-        FileFormat,
-    },
-    get_statistics_with_limit, TableProvider,
 };
 
 use super::PartitionedFile;
@@ -217,7 +216,7 @@ impl ListingOptions {
         path: &'a str,
     ) -> Result<SchemaRef> {
         let file_stream = object_store
-            .list_file_with_suffix(path, &self.file_extension)
+            .glob_file_with_suffix(path, &self.file_extension)
             .await?
             .map(move |file_meta| object_store.file_reader(file_meta?.sized_file));
         let file_schema = self.format.infer_schema(Box::pin(file_stream)).await?;
@@ -297,6 +296,10 @@ impl TableProvider for ListingTable {
 
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.table_schema)
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::Base
     }
 
     async fn scan(

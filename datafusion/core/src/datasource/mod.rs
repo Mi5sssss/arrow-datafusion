@@ -24,14 +24,17 @@ pub mod file_format;
 pub mod listing;
 pub mod memory;
 pub mod object_store_registry;
+pub mod view;
 
 use futures::Stream;
 
-pub use self::datasource::{TableProvider, TableType};
+pub use self::datasource::TableProvider;
 use self::listing::PartitionedFile;
 pub use self::memory::MemTable;
+pub use self::view::ViewTable;
 use crate::arrow::datatypes::{Schema, SchemaRef};
 use crate::error::Result;
+pub use crate::logical_expr::TableType;
 use crate::physical_plan::expressions::{MaxAccumulator, MinAccumulator};
 use crate::physical_plan::{Accumulator, ColumnStatistics, Statistics};
 use futures::StreamExt;

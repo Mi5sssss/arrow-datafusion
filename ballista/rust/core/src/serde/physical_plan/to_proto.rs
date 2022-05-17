@@ -45,7 +45,8 @@ use datafusion::physical_plan::{AggregateExpr, PhysicalExpr};
 
 use crate::serde::{protobuf, BallistaError};
 
-use datafusion::physical_plan::functions::{BuiltinScalarFunction, ScalarFunctionExpr};
+use datafusion::logical_expr::BuiltinScalarFunction;
+use datafusion::physical_plan::functions::ScalarFunctionExpr;
 
 impl TryInto<protobuf::PhysicalExprNode> for Arc<dyn AggregateExpr> {
     type Error = BallistaError;
@@ -123,6 +124,12 @@ impl TryInto<protobuf::PhysicalExprNode> for Arc<dyn AggregateExpr> {
             .is_some()
         {
             Ok(AggregateFunction::ApproxPercentileCont.into())
+        } else if self
+            .as_any()
+            .downcast_ref::<expressions::ApproxPercentileContWithWeight>()
+            .is_some()
+        {
+            Ok(AggregateFunction::ApproxPercentileContWithWeight.into())
         } else if self
             .as_any()
             .downcast_ref::<expressions::ApproxMedian>()

@@ -17,7 +17,6 @@
 
 //! Defines the sort preserving merge plan
 
-use crate::physical_plan::common::AbortOnDropMany;
 use crate::physical_plan::metrics::{
     ExecutionPlanMetricsSet, MemTrackingMetrics, MetricsSet,
 };
@@ -25,7 +24,6 @@ use log::debug;
 use parking_lot::Mutex;
 use std::any::Any;
 use std::collections::{BinaryHeap, VecDeque};
-use std::fmt::Debug;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -37,14 +35,14 @@ use arrow::{
     error::{ArrowError, Result as ArrowResult},
     record_batch::RecordBatch,
 };
-use async_trait::async_trait;
-use futures::channel::mpsc;
-use futures::stream::FusedStream;
+use futures::stream::{Fuse, FusedStream};
 use futures::{Stream, StreamExt};
+use tokio::sync::mpsc;
 
 use crate::error::{DataFusionError, Result};
 use crate::execution::context::TaskContext;
-use crate::physical_plan::sorts::{RowIndex, SortKeyCursor, SortedStream, StreamWrapper};
+use crate::physical_plan::sorts::{RowIndex, SortKeyCursor, SortedStream};
+use crate::physical_plan::stream::RecordBatchReceiverStream;
 use crate::physical_plan::{
     common::spawn_execution, expressions::PhysicalSortExpr, DisplayFormatType,
     Distribution, ExecutionPlan, Partitioning, PhysicalExpr, RecordBatchStream,
@@ -109,7 +107,6 @@ impl SortPreservingMergeExec {
     }
 }
 
-#[async_trait]
 impl ExecutionPlan for SortPreservingMergeExec {
     /// Return a reference to Any that can be used for downcasting
     fn as_any(&self) -> &dyn Any {
@@ -151,7 +148,7 @@ impl ExecutionPlan for SortPreservingMergeExec {
         )))
     }
 
-    async fn execute(
+    fn execute(
         &self,
         partition: usize,
         context: Arc<TaskContext>,
@@ -174,6 +171,8 @@ impl ExecutionPlan for SortPreservingMergeExec {
             "Number of input partitions of  SortPreservingMergeExec::execute: {}",
             input_partitions
         );
+        let schema = self.schema();
+
         match input_partitions {
             0 => Err(DataFusionError::Internal(
                 "SortPreservingMergeExec requires at least one input partition"
@@ -181,31 +180,48 @@ impl ExecutionPlan for SortPreservingMergeExec {
             )),
             1 => {
                 // bypass if there is only one partition to merge (no metrics in this case either)
-                let result = self.input.execute(0, context).await;
+                let result = self.input.execute(0, context);
                 debug!("Done getting stream for SortPreservingMergeExec::execute with 1 input");
                 result
             }
             _ => {
-                let (receivers, join_handles) = (0..input_partitions)
-                    .into_iter()
-                    .map(|part_i| {
-                        let (sender, receiver) = mpsc::channel(1);
-                        let join_handle = spawn_execution(
-                            self.input.clone(),
-                            sender,
-                            part_i,
-                            context.clone(),
-                        );
-                        (receiver, join_handle)
-                    })
-                    .unzip();
+                // Use tokio only if running from a tokio context (#2201)
+                let receivers = match tokio::runtime::Handle::try_current() {
+                    Ok(_) => (0..input_partitions)
+                        .into_iter()
+                        .map(|part_i| {
+                            let (sender, receiver) = mpsc::channel(1);
+                            let join_handle = spawn_execution(
+                                self.input.clone(),
+                                sender,
+                                part_i,
+                                context.clone(),
+                            );
+
+                            SortedStream::new(
+                                RecordBatchReceiverStream::create(
+                                    &schema,
+                                    receiver,
+                                    join_handle,
+                                ),
+                                0,
+                            )
+                        })
+                        .collect(),
+                    Err(_) => (0..input_partitions)
+                        .map(|partition| {
+                            let stream =
+                                self.input.execute(partition, context.clone())?;
+                            Ok(SortedStream::new(stream, 0))
+                        })
+                        .collect::<Result<_>>()?,
+                };
 
                 debug!("Done setting up sender-receiver for SortPreservingMergeExec::execute");
 
-                let result = Box::pin(SortPreservingMergeStream::new_from_receivers(
+                let result = Box::pin(SortPreservingMergeStream::new_from_streams(
                     receivers,
-                    AbortOnDropMany(join_handles),
-                    self.schema(),
+                    schema,
                     &self.expr,
                     tracking_metrics,
                     context.session_config().batch_size,
@@ -240,16 +256,23 @@ impl ExecutionPlan for SortPreservingMergeExec {
     }
 }
 
-#[derive(Debug)]
 struct MergingStreams {
     /// The sorted input streams to merge together
-    streams: Mutex<Vec<StreamWrapper>>,
+    streams: Mutex<Vec<Fuse<SendableRecordBatchStream>>>,
     /// number of streams
     num_streams: usize,
 }
 
+impl std::fmt::Debug for MergingStreams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MergingStreams")
+            .field("num_streams", &self.num_streams)
+            .finish()
+    }
+}
+
 impl MergingStreams {
-    fn new(input_streams: Vec<StreamWrapper>) -> Self {
+    fn new(input_streams: Vec<Fuse<SendableRecordBatchStream>>) -> Self {
         Self {
             num_streams: input_streams.len(),
             streams: Mutex::new(input_streams),
@@ -268,9 +291,6 @@ pub(crate) struct SortPreservingMergeStream {
 
     /// The sorted input streams to merge together
     streams: MergingStreams,
-
-    /// Drop helper for tasks feeding the input [`streams`](Self::streams)
-    _drop_helper: AbortOnDropMany<()>,
 
     /// For each input stream maintain a dequeue of RecordBatches
     ///
@@ -308,39 +328,6 @@ pub(crate) struct SortPreservingMergeStream {
 }
 
 impl SortPreservingMergeStream {
-    pub(crate) fn new_from_receivers(
-        receivers: Vec<mpsc::Receiver<ArrowResult<RecordBatch>>>,
-        _drop_helper: AbortOnDropMany<()>,
-        schema: SchemaRef,
-        expressions: &[PhysicalSortExpr],
-        tracking_metrics: MemTrackingMetrics,
-        batch_size: usize,
-    ) -> Self {
-        debug!("Start SortPreservingMergeStream::new_from_receivers");
-        let stream_count = receivers.len();
-        let batches = (0..stream_count)
-            .into_iter()
-            .map(|_| VecDeque::new())
-            .collect();
-        let wrappers = receivers.into_iter().map(StreamWrapper::Receiver).collect();
-
-        SortPreservingMergeStream {
-            schema,
-            batches,
-            cursor_finished: vec![true; stream_count],
-            streams: MergingStreams::new(wrappers),
-            _drop_helper,
-            column_expressions: expressions.iter().map(|x| x.expr.clone()).collect(),
-            sort_options: Arc::new(expressions.iter().map(|x| x.options).collect()),
-            tracking_metrics,
-            aborted: false,
-            in_progress: vec![],
-            next_batch_id: 0,
-            min_heap: BinaryHeap::with_capacity(stream_count),
-            batch_size,
-        }
-    }
-
     pub(crate) fn new_from_streams(
         streams: Vec<SortedStream>,
         schema: SchemaRef,
@@ -354,17 +341,13 @@ impl SortPreservingMergeStream {
             .map(|_| VecDeque::new())
             .collect();
         tracking_metrics.init_mem_used(streams.iter().map(|s| s.mem_used).sum());
-        let wrappers = streams
-            .into_iter()
-            .map(|s| StreamWrapper::Stream(Some(s)))
-            .collect();
+        let wrappers = streams.into_iter().map(|s| s.stream.fuse()).collect();
 
         Self {
             schema,
             batches,
             cursor_finished: vec![true; stream_count],
             streams: MergingStreams::new(wrappers),
-            _drop_helper: AbortOnDropMany(vec![]),
             column_expressions: expressions.iter().map(|x| x.expr.clone()).collect(),
             sort_options: Arc::new(expressions.iter().map(|x| x.options).collect()),
             tracking_metrics,
@@ -618,7 +601,6 @@ impl RecordBatchStream for SortPreservingMergeStream {
 
 #[cfg(test)]
 mod tests {
-    use crate::datafusion_data_access::object_store::local::LocalFileSystem;
     use crate::from_slice::FromSlice;
     use crate::physical_plan::metrics::MetricValue;
     use crate::test::exec::{assert_strong_count_converges_to_zero, BlockingExec};
@@ -628,7 +610,6 @@ mod tests {
     use crate::arrow::array::{Int32Array, StringArray, TimestampNanosecondArray};
     use crate::physical_plan::coalesce_partitions::CoalescePartitionsExec;
     use crate::physical_plan::expressions::col;
-    use crate::physical_plan::file_format::{CsvExec, FileScanConfig};
     use crate::physical_plan::memory::MemoryExec;
     use crate::physical_plan::sorts::sort::SortExec;
     use crate::physical_plan::{collect, common};
@@ -638,7 +619,7 @@ mod tests {
     use super::*;
     use crate::prelude::{SessionConfig, SessionContext};
     use arrow::datatypes::{DataType, Field, Schema};
-    use futures::{FutureExt, SinkExt};
+    use futures::FutureExt;
     use tokio_stream::StreamExt;
 
     #[tokio::test]
@@ -914,24 +895,9 @@ mod tests {
     async fn test_partition_sort() {
         let session_ctx = SessionContext::new();
         let task_ctx = session_ctx.task_ctx();
-        let schema = test_util::aggr_test_schema();
         let partitions = 4;
-        let (_, files) =
-            test::create_partitioned_csv("aggregate_test_100.csv", partitions).unwrap();
-
-        let csv = Arc::new(CsvExec::new(
-            FileScanConfig {
-                object_store: Arc::new(LocalFileSystem {}),
-                file_schema: Arc::clone(&schema),
-                file_groups: files,
-                statistics: Statistics::default(),
-                projection: None,
-                limit: None,
-                table_partition_cols: vec![],
-            },
-            true,
-            b',',
-        ));
+        let csv = test::scan_partitioned_csv(partitions).unwrap();
+        let schema = csv.schema();
 
         let sort = vec![
             PhysicalSortExpr {
@@ -1001,24 +967,8 @@ mod tests {
         sizes: &[usize],
         context: Arc<TaskContext>,
     ) -> Arc<dyn ExecutionPlan> {
-        let schema = test_util::aggr_test_schema();
         let partitions = 4;
-        let (_, files) =
-            test::create_partitioned_csv("aggregate_test_100.csv", partitions).unwrap();
-
-        let csv = Arc::new(CsvExec::new(
-            FileScanConfig {
-                object_store: Arc::new(LocalFileSystem {}),
-                file_schema: schema,
-                file_groups: files,
-                statistics: Statistics::default(),
-                projection: None,
-                limit: None,
-                table_partition_cols: vec![],
-            },
-            true,
-            b',',
-        ));
+        let csv = test::scan_partitioned_csv(partitions).unwrap();
 
         let sorted = basic_sort(csv, sort, context).await;
         let split: Vec<_> = sizes.iter().map(|x| split_batch(&sorted, *x)).collect();
@@ -1213,12 +1163,11 @@ mod tests {
             sorted_partitioned_input(sort.clone(), &[5, 7, 3], task_ctx.clone()).await;
 
         let partition_count = batches.output_partitioning().partition_count();
-        let mut join_handles = Vec::with_capacity(partition_count);
-        let mut receivers = Vec::with_capacity(partition_count);
+        let mut streams = Vec::with_capacity(partition_count);
 
         for partition in 0..partition_count {
-            let (mut sender, receiver) = mpsc::channel(1);
-            let mut stream = batches.execute(partition, task_ctx.clone()).await.unwrap();
+            let (sender, receiver) = mpsc::channel(1);
+            let mut stream = batches.execute(partition, task_ctx.clone()).unwrap();
             let join_handle = tokio::spawn(async move {
                 while let Some(batch) = stream.next().await {
                     sender.send(batch).await.unwrap();
@@ -1226,17 +1175,18 @@ mod tests {
                     tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
                 }
             });
-            join_handles.push(join_handle);
-            receivers.push(receiver);
+
+            streams.push(SortedStream::new(
+                RecordBatchReceiverStream::create(&schema, receiver, join_handle),
+                0,
+            ));
         }
 
         let metrics = ExecutionPlanMetricsSet::new();
         let tracking_metrics = MemTrackingMetrics::new(&metrics, 0);
 
-        let merge_stream = SortPreservingMergeStream::new_from_receivers(
-            receivers,
-            // Use empty vector since we want to use the join handles ourselves
-            AbortOnDropMany(vec![]),
+        let merge_stream = SortPreservingMergeStream::new_from_streams(
+            streams,
             batches.schema(),
             sort.as_slice(),
             tracking_metrics,
@@ -1244,11 +1194,6 @@ mod tests {
         );
 
         let mut merged = common::collect(Box::pin(merge_stream)).await.unwrap();
-
-        // Propagate any errors
-        for join_handle in join_handles {
-            join_handle.await.unwrap();
-        }
 
         assert_eq!(merged.len(), 1);
         let merged = merged.remove(0);

@@ -33,14 +33,12 @@ use arrow::{
     error::{ArrowError, Result as ArrowResult},
     record_batch::RecordBatch,
 };
-use async_trait::async_trait;
 use futures::{Stream, StreamExt, TryStreamExt};
 use log::debug;
 use parquet::arrow::{
     arrow_reader::ParquetRecordBatchReader, ArrowReader, ArrowWriter,
     ParquetFileArrowReader,
 };
-use parquet::file::reader::FileReader;
 use parquet::file::{
     metadata::RowGroupMetaData, properties::WriterProperties,
     reader::SerializedFileReader, serialized_reader::ReadOptionsBuilder,
@@ -51,6 +49,7 @@ use datafusion_common::Column;
 use datafusion_data_access::object_store::ObjectStore;
 use datafusion_expr::Expr;
 
+use crate::physical_plan::metrics::BaselineMetrics;
 use crate::physical_plan::stream::RecordBatchReceiverStream;
 use crate::{
     datasource::{file_format::parquet::ChunkObjectReader, listing::PartitionedFile},
@@ -88,6 +87,8 @@ struct ParquetFileMetrics {
     pub predicate_evaluation_errors: metrics::Count,
     /// Number of row groups pruned using
     pub row_groups_pruned: metrics::Count,
+    /// Total number of bytes scanned
+    pub bytes_scanned: metrics::Count,
 }
 
 impl ParquetExec {
@@ -152,14 +153,18 @@ impl ParquetFileMetrics {
             .with_new_label("filename", filename.to_string())
             .counter("row_groups_pruned", partition);
 
+        let bytes_scanned = MetricBuilder::new(metrics)
+            .with_new_label("filename", filename.to_string())
+            .counter("bytes_scanned", partition);
+
         Self {
             predicate_evaluation_errors,
             row_groups_pruned,
+            bytes_scanned,
         }
     }
 }
 
-#[async_trait]
 impl ExecutionPlan for ParquetExec {
     /// Return a reference to Any that can be used for downcasting
     fn as_any(&self) -> &dyn Any {
@@ -195,7 +200,7 @@ impl ExecutionPlan for ParquetExec {
         Ok(self)
     }
 
-    async fn execute(
+    fn execute(
         &self,
         partition_index: usize,
         context: Arc<TaskContext>,
@@ -223,6 +228,7 @@ impl ExecutionPlan for ParquetExec {
             files: self.base_config.file_groups[partition_index].clone().into(),
             projector: partition_col_proj,
             adapter: SchemaAdapter::new(self.base_config.file_schema.clone()),
+            baseline_metrics: BaselineMetrics::new(&self.metrics, partition_index),
         };
 
         // Use spawn_blocking only if running from a tokio context (#2201)
@@ -285,19 +291,6 @@ impl ExecutionPlan for ParquetExec {
     }
 }
 
-/// Special-case empty column projection
-///
-/// This is a workaround for https://github.com/apache/arrow-rs/issues/1537
-enum ProjectedReader {
-    Reader {
-        reader: ParquetRecordBatchReader,
-    },
-    EmptyProjection {
-        remaining_rows: usize,
-        batch_size: usize,
-    },
-}
-
 /// Implements [`RecordBatchStream`] for a collection of [`PartitionedFile`]
 ///
 /// NB: This will perform blocking IO synchronously without yielding which may
@@ -313,19 +306,24 @@ struct ParquetExecStream {
     schema: SchemaRef,
     projection: Vec<usize>,
     remaining_rows: Option<usize>,
-    reader: Option<(ProjectedReader, PartitionedFile)>,
+    reader: Option<(ParquetRecordBatchReader, PartitionedFile)>,
     files: VecDeque<PartitionedFile>,
     projector: PartitionColumnProjector,
     adapter: SchemaAdapter,
+    baseline_metrics: BaselineMetrics,
 }
 
 impl ParquetExecStream {
-    fn create_reader(&mut self, file: &PartitionedFile) -> Result<ProjectedReader> {
+    fn create_reader(
+        &mut self,
+        file: &PartitionedFile,
+    ) -> Result<ParquetRecordBatchReader> {
         let file_metrics = ParquetFileMetrics::new(
             self.partition_index,
             file.file_meta.path(),
             &self.metrics,
         );
+        let bytes_scanned = file_metrics.bytes_scanned.clone();
         let object_reader = self
             .object_store
             .file_reader(file.file_meta.sized_file.clone())?;
@@ -347,23 +345,12 @@ impl ParquetExecStream {
         }
 
         let file_reader = SerializedFileReader::new_with_options(
-            ChunkObjectReader(object_reader),
+            ChunkObjectReader {
+                object_reader,
+                bytes_scanned: Some(bytes_scanned),
+            },
             opt.build(),
         )?;
-
-        if self.projection.is_empty() {
-            let remaining_rows = file_reader
-                .metadata()
-                .file_metadata()
-                .num_rows()
-                .try_into()
-                .expect("Row count should always be greater than or equal to 0 and less than usize::MAX");
-
-            return Ok(ProjectedReader::EmptyProjection {
-                remaining_rows,
-                batch_size: self.batch_size,
-            });
-        }
 
         let mut arrow_reader = ParquetFileArrowReader::new(Arc::new(file_reader));
 
@@ -374,7 +361,7 @@ impl ParquetExecStream {
         let reader = arrow_reader
             .get_record_reader_by_columns(adapted_projections, self.batch_size)?;
 
-        Ok(ProjectedReader::Reader { reader })
+        Ok(reader)
     }
 }
 
@@ -382,6 +369,10 @@ impl Iterator for ParquetExecStream {
     type Item = ArrowResult<RecordBatch>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        let cloned_time = self.baseline_metrics.elapsed_compute().clone();
+        // records time on drop
+        let _timer = cloned_time.timer();
+
         if self.error || matches!(self.remaining_rows, Some(0)) {
             return None;
         }
@@ -402,30 +393,17 @@ impl Iterator for ParquetExecStream {
                 },
             };
 
-            let result = match reader {
-                ProjectedReader::Reader { reader } => reader.next().map(|result| {
-                    result
-                        .and_then(|batch| {
-                            self.adapter
-                                .adapt_batch(batch, &self.projection)
-                                .map_err(|e| ArrowError::ExternalError(Box::new(e)))
-                        })
-                        .and_then(|batch| {
-                            self.projector.project(batch, &file.partition_values)
-                        })
-                }),
-                ProjectedReader::EmptyProjection {
-                    remaining_rows,
-                    batch_size,
-                } => {
-                    let size = *remaining_rows.min(batch_size);
-                    *remaining_rows -= size;
-                    (size != 0).then(|| {
-                        self.projector
-                            .project_from_size(size, &file.partition_values)
+            let result = reader.next().map(|result| {
+                result
+                    .and_then(|batch| {
+                        self.adapter
+                            .adapt_batch(batch, &self.projection)
+                            .map_err(|e| ArrowError::ExternalError(Box::new(e)))
                     })
-                }
-            };
+                    .and_then(|batch| {
+                        self.projector.project(batch, &file.partition_values)
+                    })
+            });
 
             let result = match result {
                 Some(result) => result,
@@ -442,6 +420,11 @@ impl Iterator for ParquetExecStream {
                 _ => self.error = result.is_err(),
             }
 
+            //record output rows in parquetExec
+            if let Ok(batch) = &result {
+                self.baseline_metrics.record_output(batch.num_rows());
+            }
+
             return Some(result);
         }
     }
@@ -454,7 +437,8 @@ impl Stream for ParquetExecStream {
         mut self: Pin<&mut Self>,
         _cx: &mut Context<'_>,
     ) -> Poll<Option<Self::Item>> {
-        Poll::Ready(Iterator::next(&mut *self))
+        let poll = Poll::Ready(Iterator::next(&mut *self));
+        self.baseline_metrics.record_poll(poll)
     }
 }
 
@@ -619,7 +603,7 @@ pub async fn plan_to_parquet(
                     writer_properties.clone(),
                 )?;
                 let task_ctx = Arc::new(TaskContext::from(state));
-                let stream = plan.execute(i, task_ctx).await?;
+                let stream = plan.execute(i, task_ctx)?;
                 let handle: tokio::task::JoinHandle<Result<()>> =
                     tokio::task::spawn(async move {
                         stream
@@ -1086,7 +1070,7 @@ mod tests {
         );
         assert_eq!(parquet_exec.output_partitioning().partition_count(), 1);
 
-        let mut results = parquet_exec.execute(0, task_ctx).await?;
+        let mut results = parquet_exec.execute(0, task_ctx)?;
         let batch = results.next().await.unwrap()?;
 
         assert_eq!(8, batch.num_rows());
@@ -1138,7 +1122,7 @@ mod tests {
                 None,
             );
             assert_eq!(parquet_exec.output_partitioning().partition_count(), 1);
-            let results = parquet_exec.execute(0, task_ctx).await?.next().await;
+            let results = parquet_exec.execute(0, task_ctx)?.next().await;
 
             if let Some(expected_row_num) = expected_row_num {
                 let batch = results.unwrap()?;
@@ -1217,7 +1201,7 @@ mod tests {
         );
         assert_eq!(parquet_exec.output_partitioning().partition_count(), 1);
 
-        let mut results = parquet_exec.execute(0, task_ctx).await?;
+        let mut results = parquet_exec.execute(0, task_ctx)?;
         let batch = results.next().await.unwrap()?;
         let expected = vec![
             "+----+----------+-------------+-------+",
@@ -1274,7 +1258,7 @@ mod tests {
             None,
         );
 
-        let mut results = parquet_exec.execute(0, task_ctx).await?;
+        let mut results = parquet_exec.execute(0, task_ctx)?;
         let batch = results.next().await.unwrap();
         // invalid file should produce an error to that effect
         assert_contains!(

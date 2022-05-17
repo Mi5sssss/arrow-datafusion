@@ -17,7 +17,7 @@
 
 use std::sync::Arc;
 
-use crate::expressions::binary::{eq_decimal, eq_decimal_scalar};
+use crate::expressions::binary::{eq_decimal, eq_decimal_scalar, eq_null};
 use arrow::array::Array;
 use arrow::array::*;
 use arrow::compute::kernels::boolean::nullif;
@@ -101,23 +101,6 @@ pub fn nullif_func(args: &[ColumnarValue]) -> Result<ColumnarValue> {
         )),
     }
 }
-
-/// Currently supported types by the nullif function.
-/// The order of these types correspond to the order on which coercion applies
-/// This should thus be from least informative to most informative
-pub static SUPPORTED_NULLIF_TYPES: &[DataType] = &[
-    DataType::Boolean,
-    DataType::UInt8,
-    DataType::UInt16,
-    DataType::UInt32,
-    DataType::UInt64,
-    DataType::Int8,
-    DataType::Int16,
-    DataType::Int32,
-    DataType::Int64,
-    DataType::Float32,
-    DataType::Float64,
-];
 
 #[cfg(test)]
 mod tests {

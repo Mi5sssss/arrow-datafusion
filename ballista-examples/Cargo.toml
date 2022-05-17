@@ -35,10 +35,10 @@ path = "examples/test_sql.rs"
 required-features = ["ballista/standalone"]
 
 [dependencies]
-ballista = { path = "../ballista/rust/client", version = "0.6.0" }
+ballista = { path = "../ballista/rust/client", version = "0.7.0" }
 datafusion = { path = "../datafusion/core" }
 futures = "0.3"
 num_cpus = "1.13.0"
-prost = "0.9"
+prost = "0.10"
 tokio = { version = "1.0", features = ["macros", "rt", "rt-multi-thread", "sync", "parking_lot"] }
-tonic = "0.6"
+tonic = "0.7"
